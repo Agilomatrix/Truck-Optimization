@@ -44,6 +44,9 @@ _ALIASES = {
     "Dispatch Date": ["dispatch date", "dispatch month", "date", "month", "dispatch dt"],
     "Dispatch Quantity": ["dispatch quantity", "dispatch qty", "quantity", "qty"],
     "Part Description": ["part description", "description", "part name"],
+    "Packaging ID": ["packaging id", "packaging", "pack id", "packaging code"],
+    "Qty per Packaging": ["qty per packaging", "quantity per packaging", "qty per pack", "parts per box",
+                          "qty per box", "std pack qty", "std pack", "standard pack quantity"],
 }
 NAVY, TEAL = "0B2545", "13A89E"
 
@@ -162,18 +165,30 @@ def validate_dispatch(df: pd.DataFrame) -> Tuple[Optional[pd.DataFrame], List[Di
 
 
 def read_master(df: pd.DataFrame) -> Tuple[Optional[pd.DataFrame], List[str]]:
-    """Optional part master list: parts known to exist even if never dispatched."""
+    """Complete Part Master: every part that exists (so Non-Moving parts can be identified).
+    Optional link columns: Packaging ID, Qty per Packaging (parts per pack)."""
     cols = _map_columns(df)
     if "Part Number" not in cols:
-        return None, ["Part master file needs a 'Part Number' column – it was ignored."]
-    m = pd.DataFrame({"Part Number": df[cols["Part Number"]].map(clean_part),
-                      "Part Description": df[cols["Part Description"]].map(lambda v: "" if _blank(v) else str(v).strip())
-                      if "Part Description" in cols else ""})
+        return None, ["Part Master needs a 'Part Number' column – it was ignored."]
+    n = len(df)
+    m = pd.DataFrame({
+        "Part Number": df[cols["Part Number"]].map(clean_part),
+        "Part Description": df[cols["Part Description"]].map(lambda v: "" if _blank(v) else str(v).strip())
+        if "Part Description" in cols else [""] * n,
+        "Packaging ID": df[cols["Packaging ID"]].map(clean_part) if "Packaging ID" in cols else [""] * n,
+        "Qty per Packaging": pd.to_numeric(df[cols["Qty per Packaging"]].astype(str).str.replace(",", "", regex=False),
+                                           errors="coerce") if "Qty per Packaging" in cols else [float("nan")] * n,
+    })
+    msgs = []
     n_blank = int((m["Part Number"] == "").sum())
-    m = m[m["Part Number"] != ""].drop_duplicates("Part Number")
+    if n_blank:
+        msgs.append(f"{n_blank} blank Part Number row(s) in the Part Master were skipped.")
+    m = m[m["Part Number"] != ""]
     m["key"] = m["Part Number"].str.upper()
-    msgs = [f"{n_blank} blank Part Number row(s) in the part master were skipped."] if n_blank else []
-    return m, msgs
+    n_dup = int(m["key"].duplicated().sum())
+    if n_dup:
+        msgs.append(f"{n_dup} duplicate Part Number row(s) in the Part Master – the first occurrence is used.")
+    return m.drop_duplicates("key").reset_index(drop=True), msgs
 
 
 # --------------------------------------------------------------------------- #
