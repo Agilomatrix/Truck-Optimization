@@ -42,7 +42,7 @@ def _num(v):
         return None, "bad"
 
 
-def validate_dataframe(df: pd.DataFrame, gross_tol: float = 0.05
+def validate_dataframe(df: pd.DataFrame, gross_tol: float = 0.05, quantity_optional: bool = False
                        ) -> Tuple[List[Packaging], List[Dict], List[Dict]]:
     """Return (packagings, errors, warnings). If errors is non-empty, do not calculate."""
     errors: List[Dict] = []
@@ -55,12 +55,15 @@ def validate_dataframe(df: pd.DataFrame, gross_tol: float = 0.05
         warnings.append({"Row": row, "Packaging ID": pid, "Column": col, "Issue": msg})
 
     actual = {_norm(c): c for c in df.columns}
-    missing = [c for c in REQUIRED_COLUMNS if _norm(c) not in actual]
+    required = [c for c in REQUIRED_COLUMNS if not (quantity_optional and c == "Quantity")]
+    missing = [c for c in required if _norm(c) not in actual]
     if missing:
         err("-", "-", ", ".join(missing), "Required column(s) missing from the uploaded file.")
         return [], errors, warnings
 
-    d = pd.DataFrame({c: df[actual[_norm(c)]] for c in REQUIRED_COLUMNS})
+    d = pd.DataFrame({c: df[actual[_norm(c)]] for c in REQUIRED_COLUMNS if _norm(c) in actual})
+    if "Quantity" not in d:          # quantities come from the current part shipment instead
+        d["Quantity"] = None
     has_orient = _norm(ORIENT_COL) in actual
     d[ORIENT_COL] = df[actual[_norm(ORIENT_COL)]] if has_orient else None
     d = d.dropna(how="all", subset=REQUIRED_COLUMNS)
@@ -117,7 +120,9 @@ def validate_dataframe(df: pd.DataFrame, gross_tol: float = 0.05
 
         q, st = _num(r["Quantity"])
         qty = 0
-        if st != "ok":
+        if quantity_optional and st == "blank":
+            qty = 1                  # placeholder – real quantity is derived from the part shipment
+        elif st != "ok":
             err(row, label, "Quantity", "Value is missing." if st == "blank" else "Value is not a number.")
         elif q <= 0 or abs(q - round(q)) > 1e-9:
             err(row, label, "Quantity", "Quantity must be a positive whole number.")
