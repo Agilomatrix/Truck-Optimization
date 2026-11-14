@@ -12,6 +12,7 @@ from report import (build_excel_report, comparison_df, loading_details_df,
                     summary_rows, truck_wise_df)
 from sample_data import build_template_bytes
 from truck_config import SETTINGS, load_trucks
+from part_runner_ui import render_part_runner
 from validators import REQUIRED_COLUMNS, validate_dataframe
 
 NAVY, TEAL, LIGHT = "#0B2545", "#13A89E", "#EEF4F8"
@@ -30,7 +31,7 @@ st.markdown(f"""
 h2, h3 {{color:{NAVY};}}
 </style>
 <div class="hdr"><h1>🚚 Truck Loading Optimization Tool</h1>
-<p>Upload packaging data → automatic loading calculation, truck recommendation and cost comparison</p></div>
+<p>Truck loading &amp; truck recommendation · Part runner classification (Fast / High / Medium / Slow / Stranger / Non-Moving)</p></div>
 """, unsafe_allow_html=True)
 
 
@@ -79,142 +80,149 @@ def layer_figure(info):
     return fig
 
 
-# --------------------------------------------------------------------------- #
-# Upload
-# --------------------------------------------------------------------------- #
-try:
-    TRUCKS = load_trucks()
-except ValueError as e:
-    st.error(f"Truck configuration error: {e}")
-    st.stop()
+def truck_loading_tab():
+    # Upload / validate / calculate / results
+    # --------------------------------------------------------------------------- #
+    try:
+        TRUCKS = load_trucks()
+    except ValueError as e:
+        st.error(f"Truck configuration error: {e}")
+        return
 
-c1, c2 = st.columns([3, 1])
-with c1:
-    up = st.file_uploader("Upload packaging data (Excel or CSV)", type=["xlsx", "xls", "csv"])
-with c2:
-    st.write("")
-    st.write("")
-    st.download_button("⬇ Download sample template", build_template_bytes(),
-                       file_name="sample_packaging_data.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    c1, c2 = st.columns([3, 1])
+    with c1:
+        up = st.file_uploader("Upload packaging data (Excel or CSV)", type=["xlsx", "xls", "csv"], key="truck_upload")
+    with c2:
+        st.write("")
+        st.write("")
+        st.download_button("⬇ Download sample template", build_template_bytes(),
+                           file_name="sample_packaging_data.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-with st.expander("Truck database in use (edit truck_config.py to change – values are illustrative)"):
-    st.dataframe(pd.DataFrame([{
-        "Truck": t.name, "Internal L×W×H (mm)": f"{t.length_mm}×{t.width_mm}×{t.height_mm}",
-        "Payload (kg)": t.payload_kg, "Cost (₹)": t.cost,
-        "Door W×H (mm)": f"{t.door_width_mm}×{t.door_height_mm}",
-        "Clearance L/W/H (mm)": f"{t.clearance_length_mm}/{t.clearance_width_mm}/{t.clearance_height_mm}",
-        "Available": "unlimited" if t.available is None else t.available} for t in TRUCKS]), hide_index=True)
+    with st.expander("Truck database in use (edit truck_config.py to change – values are illustrative)"):
+        st.dataframe(pd.DataFrame([{
+            "Truck": t.name, "Internal L×W×H (mm)": f"{t.length_mm}×{t.width_mm}×{t.height_mm}",
+            "Payload (kg)": t.payload_kg, "Cost (₹)": t.cost,
+            "Door W×H (mm)": f"{t.door_width_mm}×{t.door_height_mm}",
+            "Clearance L/W/H (mm)": f"{t.clearance_length_mm}/{t.clearance_width_mm}/{t.clearance_height_mm}",
+            "Available": "unlimited" if t.available is None else t.available} for t in TRUCKS]), hide_index=True)
 
-if up is None:
-    st.info("Upload a file to begin. Required columns: " + ", ".join(REQUIRED_COLUMNS)
-            + ". Optional: Orientation Restriction (Fixed / Upright / Any).")
-    st.stop()
+    if up is None:
+        st.info("Upload a file to begin. Required columns: " + ", ".join(REQUIRED_COLUMNS)
+                + ". Optional: Orientation Restriction (Fixed / Upright / Any).")
+        return
 
-try:
-    raw = up.getvalue()
-    if up.name.lower().endswith(".csv"):
-        df = pd.read_csv(io.BytesIO(raw))
+    try:
+        raw = up.getvalue()
+        if up.name.lower().endswith(".csv"):
+            df = pd.read_csv(io.BytesIO(raw))
+        else:
+            xl = pd.ExcelFile(io.BytesIO(raw))
+            df = xl.parse("Packaging Data" if "Packaging Data" in xl.sheet_names else xl.sheet_names[0])
+    except Exception as e:  # noqa: BLE001
+        st.error(f"Could not read the file: {e}")
+        return
+
+    pkgs, errors, warns = validate_dataframe(df, SETTINGS["gross_weight_tolerance_kg"])
+    st.subheader("Uploaded data")
+    st.dataframe(df, hide_index=True)
+    if warns:
+        with st.expander(f"⚠ {len(warns)} warning(s)", expanded=True):
+            st.dataframe(pd.DataFrame(warns), hide_index=True)
+    if errors:
+        st.error(f"{len(errors)} data problem(s) found. Fix them in the file and upload again – no calculation was run.")
+        st.dataframe(pd.DataFrame(errors), hide_index=True)
+        return
+    st.success(f"{len(pkgs)} packaging type(s) validated.")
+
+    if st.button("🧮 Calculate loading plan", type="primary"):
+        with st.spinner("Calculating loading plans for all truck options…"):
+            try:
+                st.session_state["result"] = Optimizer(pkgs, TRUCKS, SETTINGS).optimize()
+                st.session_state["file"] = up.name
+            except Exception as e:  # noqa: BLE001
+                st.session_state.pop("result", None)
+                st.error(f"Calculation failed: {e}")
+
+    res = st.session_state.get("result")
+    if res is None or st.session_state.get("file") != up.name:
+        return
+
+    # --------------------------------------------------------------------------- #
+    # Results
+    # --------------------------------------------------------------------------- #
+    rec = res.recommended
+    for w in res.warnings:
+        st.warning(w)
+    if rec is None:
+        st.error("No truck option can carry this shipment. See the rejection reasons below.")
     else:
-        xl = pd.ExcelFile(io.BytesIO(raw))
-        df = xl.parse("Packaging Data" if "Packaging Data" in xl.sheet_names else xl.sheet_names[0])
-except Exception as e:  # noqa: BLE001
-    st.error(f"Could not read the file: {e}")
-    st.stop()
+        pallets = sum(l.pallets for l in rec.loads)
+        problems = [p for l in rec.loads for p in verify_load(l, pkgs)]
+        if problems:
+            st.error("Internal verification found problems in the recommended plan: " + "; ".join(problems))
+        cols = st.columns(4)
+        items = [("Total Packaging Quantity", f"{res.total_qty:,}", f"{len(pkgs)} packaging type(s)"),
+                 ("Shipment Gross Weight", f"{res.total_cargo_weight:,.0f} kg", "boxes only"),
+                 ("Total Pallets Required", f"{pallets}", rec.scenario),
+                 ("Recommended Truck", rec.label, f"{rec.scenario}"),
+                 ("Trucks Required", f"{rec.n_trucks}", ""),
+                 ("Total Transportation Cost", f"₹{rec.cost:,.0f}", "lowest feasible option"),
+                 ("Space Utilization", f"{rec.space_util:.1%}", "volume of cargo / truck volume"),
+                 ("Weight Utilization", f"{rec.weight_util:.1%}", "load / payload")]
+        for i, it in enumerate(items):
+            with cols[i % 4]:
+                st.markdown(card(*it), unsafe_allow_html=True)
+            if i == 3:
+                cols = st.columns(4)
 
-pkgs, errors, warns = validate_dataframe(df, SETTINGS["gross_weight_tolerance_kg"])
-st.subheader("Uploaded data")
-st.dataframe(df, hide_index=True)
-if warns:
-    with st.expander(f"⚠ {len(warns)} warning(s)", expanded=True):
-        st.dataframe(pd.DataFrame(warns), hide_index=True)
-if errors:
-    st.error(f"{len(errors)} data problem(s) found. Fix them in the file and upload again – no calculation was run.")
-    st.dataframe(pd.DataFrame(errors), hide_index=True)
-    st.stop()
-st.success(f"{len(pkgs)} packaging type(s) validated.")
+        st.download_button("⬇ Download Excel report", build_excel_report(res), file_name="truck_loading_report.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
 
-if st.button("🧮 Calculate loading plan", type="primary"):
-    with st.spinner("Calculating loading plans for all truck options…"):
-        try:
-            st.session_state["result"] = Optimizer(pkgs, TRUCKS, SETTINGS).optimize()
-            st.session_state["file"] = up.name
-        except Exception as e:  # noqa: BLE001
-            st.session_state.pop("result", None)
-            st.error(f"Calculation failed: {e}")
+    st.subheader("Truck comparison")
+    comp = comparison_df(res)
+    st.dataframe(comp, hide_index=True)
+    feas = comp[comp["Feasibility"] == "Feasible"]
+    if not feas.empty:
+        feas = feas.assign(lbl=feas["Truck Type"] + " · " + feas["Loading Method"].str.replace(" Loading", "", regex=False))
+        fig = go.Figure(go.Bar(x=feas["Total Cost (₹)"], y=feas["lbl"], orientation="h",
+                               marker_color=[TEAL if r.startswith("✔") else NAVY for r in feas["Remarks"]],
+                               text=[f"₹{v:,.0f}" for v in feas["Total Cost (₹)"]], textposition="outside"))
+        fig.update_layout(height=max(260, 34 * len(feas) + 80), margin=dict(l=10, r=40, t=30, b=10),
+                          title="Total transportation cost by option", yaxis=dict(autorange="reversed"),
+                          plot_bgcolor="white")
+        st.plotly_chart(fig)
 
-res = st.session_state.get("result")
-if res is None or st.session_state.get("file") != up.name:
-    st.stop()
+    if rec:
+        st.subheader("Loading details (recommended option)")
+        st.dataframe(loading_details_df(rec, pkgs), hide_index=True)
+        st.dataframe(truck_wise_df(rec), hide_index=True)
 
-# --------------------------------------------------------------------------- #
-# Results
-# --------------------------------------------------------------------------- #
-rec = res.recommended
-for w in res.warnings:
-    st.warning(w)
-if rec is None:
-    st.error("No truck option can carry this shipment. See the rejection reasons below.")
-else:
-    pallets = sum(l.pallets for l in rec.loads)
-    problems = [p for l in rec.loads for p in verify_load(l, pkgs)]
-    if problems:
-        st.error("Internal verification found problems in the recommended plan: " + "; ".join(problems))
-    cols = st.columns(4)
-    items = [("Total Packaging Quantity", f"{res.total_qty:,}", f"{len(pkgs)} packaging type(s)"),
-             ("Shipment Gross Weight", f"{res.total_cargo_weight:,.0f} kg", "boxes only"),
-             ("Total Pallets Required", f"{pallets}", rec.scenario),
-             ("Recommended Truck", rec.label, f"{rec.scenario}"),
-             ("Trucks Required", f"{rec.n_trucks}", ""),
-             ("Total Transportation Cost", f"₹{rec.cost:,.0f}", "lowest feasible option"),
-             ("Space Utilization", f"{rec.space_util:.1%}", "volume of cargo / truck volume"),
-             ("Weight Utilization", f"{rec.weight_util:.1%}", "load / payload")]
-    for i, it in enumerate(items):
-        with cols[i % 4]:
-            st.markdown(card(*it), unsafe_allow_html=True)
-        if i == 3:
-            cols = st.columns(4)
+        st.subheader("Loading arrangement")
+        names = [f"Truck {i} – {l.truck.name}" for i, l in enumerate(rec.loads, 1)]
+        pick = st.selectbox("Select truck", names)
+        load = rec.loads[names.index(pick)]
+        st.plotly_chart(floor_figure(load, pkgs))
+        pal_info = {}
+        for l in rec.loads:
+            for pid, inf in l.info.items():
+                if inf.get("method") == "Pallet":
+                    pal_info.setdefault(pid, inf)
+        if pal_info:
+            st.markdown("**Pallet layer pattern**")
+            cs = st.columns(min(3, len(pal_info)))
+            for i, (pid, inf) in enumerate(pal_info.items()):
+                with cs[i % len(cs)]:
+                    st.caption(f"{pid}: {inf['per_layer']} boxes/layer × {inf['layers']} layers = {inf['boxes_per_pallet']} per pallet")
+                    st.plotly_chart(layer_figure(inf))
 
-    st.download_button("⬇ Download Excel report", build_excel_report(res), file_name="truck_loading_report.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
+    with st.expander("Assumptions and constraints that could NOT be verified"):
+        for n in res.notes:
+            st.markdown(f"- {n}")
 
-st.subheader("Truck comparison")
-comp = comparison_df(res)
-st.dataframe(comp, hide_index=True)
-feas = comp[comp["Feasibility"] == "Feasible"]
-if not feas.empty:
-    feas = feas.assign(lbl=feas["Truck Type"] + " · " + feas["Loading Method"].str.replace(" Loading", "", regex=False))
-    fig = go.Figure(go.Bar(x=feas["Total Cost (₹)"], y=feas["lbl"], orientation="h",
-                           marker_color=[TEAL if r.startswith("✔") else NAVY for r in feas["Remarks"]],
-                           text=[f"₹{v:,.0f}" for v in feas["Total Cost (₹)"]], textposition="outside"))
-    fig.update_layout(height=max(260, 34 * len(feas) + 80), margin=dict(l=10, r=40, t=30, b=10),
-                      title="Total transportation cost by option", yaxis=dict(autorange="reversed"),
-                      plot_bgcolor="white")
-    st.plotly_chart(fig)
 
-if rec:
-    st.subheader("Loading details (recommended option)")
-    st.dataframe(loading_details_df(rec, pkgs), hide_index=True)
-    st.dataframe(truck_wise_df(rec), hide_index=True)
-
-    st.subheader("Loading arrangement")
-    names = [f"Truck {i} – {l.truck.name}" for i, l in enumerate(rec.loads, 1)]
-    pick = st.selectbox("Select truck", names)
-    load = rec.loads[names.index(pick)]
-    st.plotly_chart(floor_figure(load, pkgs))
-    pal_info = {}
-    for l in rec.loads:
-        for pid, inf in l.info.items():
-            if inf.get("method") == "Pallet":
-                pal_info.setdefault(pid, inf)
-    if pal_info:
-        st.markdown("**Pallet layer pattern**")
-        cs = st.columns(min(3, len(pal_info)))
-        for i, (pid, inf) in enumerate(pal_info.items()):
-            with cs[i % len(cs)]:
-                st.caption(f"{pid}: {inf['per_layer']} boxes/layer × {inf['layers']} layers = {inf['boxes_per_pallet']} per pallet")
-                st.plotly_chart(layer_figure(inf))
-
-with st.expander("Assumptions and constraints that could NOT be verified"):
-    for n in res.notes:
-        st.markdown(f"- {n}")
+tab_truck, tab_runner = st.tabs(["🚚 Truck Loading", "📊 Part Runner Classification"])
+with tab_truck:
+    truck_loading_tab()
+with tab_runner:
+    render_part_runner()
